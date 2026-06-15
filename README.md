@@ -11,9 +11,12 @@ Vulnerability intel tells you *what* is exploitable on a target. `nuclei-index` 
 ## Install
 
 ```bash
-pip install nuclei-index
-# or from source:
-pip install .
+# from GitHub:
+pip install git+https://github.com/sonnycroco/nuclei-index
+
+# or from a local clone:
+git clone https://github.com/sonnycroco/nuclei-index
+pip install ./nuclei-index
 ```
 
 You also need a local nuclei-templates checkout. If you run nuclei, you already have one:
