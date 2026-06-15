@@ -85,6 +85,44 @@ def test_cache_is_reused(monkeypatch, tmp_path):
     assert ni.build_index()["_meta"]["cves"] == 2
 
 
+def test_cache_hit_does_not_rebuild(monkeypatch, tmp_path):
+    """The freshness signal must JSON-round-trip so an unchanged tree is a cache
+    hit. Regression trap: a tuple sig deserializes to a list and never compares
+    equal, so the cache would rebuild on every call."""
+    import time
+    _isolate(monkeypatch, tmp_path, _fake_templates(tmp_path))
+    ni.build_index(force=True)
+    cache = ni._cache_file()
+    before = cache.stat().st_mtime_ns
+    time.sleep(0.02)
+    ni.build_index()  # no force, nothing changed -> must NOT rewrite the cache
+    assert cache.stat().st_mtime_ns == before, "cache was rebuilt on a clean hit"
+
+
+def test_cve_under_any_cves_subtree_busts_cache(monkeypatch, tmp_path):
+    """A CVE added under a cves/ subtree other than http/cves must invalidate
+    the auto-rebuild freshness signal (regression: only http/cves was watched,
+    so network/cves additions served a stale cache -> false-negative lookups)."""
+    import time
+    root = tmp_path / "nuclei-templates"
+    _make_template(root / "http" / "cves" / "2021" / "CVE-2021-44228.yaml",
+                   "CVE-2021-44228", "Apache Log4j RCE", "critical")
+    # Pre-create the network/cves/ dir so that adding a *year* under it later
+    # does NOT bump root's or http/cves' mtime — otherwise the cache would bust
+    # for an unrelated reason and mask the bug.
+    (root / "network" / "cves").mkdir(parents=True)
+    _isolate(monkeypatch, tmp_path, root)
+    assert ni.build_index(force=True)["_meta"]["cves"] == 1
+
+    time.sleep(1.1)  # 1s filesystem mtime granularity — ensure it differs
+    _make_template(root / "network" / "cves" / "2023" / "CVE-2023-1234.yaml",
+                   "CVE-2023-1234", "Some network-layer CVE", "high")
+
+    idx = ni.build_index()  # NO force — must notice the new template
+    assert idx["_meta"]["cves"] == 2
+    assert ni.templates_for_cve("CVE-2023-1234") != []
+
+
 def test_cli_json(monkeypatch, tmp_path, capsys):
     _isolate(monkeypatch, tmp_path, _fake_templates(tmp_path))
     ni.cli(["--cve", "CVE-2021-44228", "--host", "https://t", "--json"])
