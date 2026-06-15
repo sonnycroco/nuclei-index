@@ -82,7 +82,7 @@ This tool only *constructs* commands — it never scans anything itself. The emi
 ## Development
 
 ```bash
-pip install -e . pytest
+pip install -e ".[dev]"
 pytest
 ```
 
