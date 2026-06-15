@@ -21,6 +21,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [project.urls]
 Homepage = "https://github.com/sonnycroco/nuclei-index"
 Issues = "https://github.com/sonnycroco/nuclei-index/issues"
