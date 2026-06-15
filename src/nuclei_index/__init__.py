@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""
+nuclei_index — map CVE IDs to your local nuclei-templates, and emit a runnable,
+rate-limited nuclei command for a matched CVE.
+
+Vulnerability intel tells you *what* is exploitable on a target; this hands you
+the firing pin — the concrete `nuclei` check to run. It indexes a local
+nuclei-templates checkout by CVE ID and caches the result, so "CVE-X applies"
+becomes "run this".
+
+The index is cached under $XDG_CACHE_HOME/nuclei-index (or ~/.cache/nuclei-index)
+and rebuilt automatically when the templates directory changes (or on rebuild).
+
+Importable API:
+    templates_dir() -> Path | None
+    build_index(force=False) -> dict
+    templates_for_cve("CVE-2021-44228") -> list[dict]   # {cve,id,path,name,severity}
+    runnable_cmd("CVE-2021-44228", host, rate=20, by_path=False) -> str | None
+    runnable_cmds("CVE-2021-44228", host, rate=20, by_path=False) -> list[str]
+
+CLI:
+    nuclei-index --rebuild
+    nuclei-index --cve CVE-2021-44228 [--host https://t] [--by-path] [--json]
+    nuclei-index --stats [--json]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+_CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
+
+# Severity rank for choosing a single "best" template when a CVE has several.
+_SEV_RANK = {
+    "critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "unknown": 0,
+}
+
+
+def cache_dir() -> Path:
+    """Where the index is cached. Honors $XDG_CACHE_HOME, else ~/.cache."""
+    base = os.getenv("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "nuclei-index"
+
+
+def _cache_file() -> Path:
+    return cache_dir() / "nuclei_cve_index.json"
+
+
+def _candidate_dirs() -> list[str]:
+    """Likely nuclei-templates locations, $NUCLEI_TEMPLATES taking priority."""
+    return [
+        os.getenv("NUCLEI_TEMPLATES", ""),
+        str(Path.home() / "nuclei-templates"),
+        str(Path.home() / ".local" / "nuclei-templates"),
+        str(Path.home() / ".config" / "nuclei" / "templates"),
+    ]
+
+
+def templates_dir() -> Path | None:
+    for c in _candidate_dirs():
+        if c and Path(c).is_dir():
+            return Path(c)
+    return None
+
+
+def _newest_mtime(root: Path) -> float:
+    """Cheap freshness signal: mtime of the cves/ subtree top dirs.
+
+    Catches templates added or removed (dir mtime changes); will not notice an
+    in-place edit to an existing file that leaves the directory listing intact.
+    That's fine for a git-pull-driven templates checkout — use --rebuild if you
+    hand-edit templates.
+    """
+    newest = root.stat().st_mtime
+    for sub in ("http/cves", "cves"):
+        d = root / sub
+        if d.is_dir():
+            newest = max(newest, d.stat().st_mtime)
+            for year in d.iterdir():
+                if year.is_dir():
+                    newest = max(newest, year.stat().st_mtime)
+    return newest
+
+
+def _parse_template(path: Path) -> dict | None:
+    """Lightweight parse — no yaml dep; pull id/name/severity by line."""
+    cid = name = sev = ""
+    try:
+        with path.open(encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                s = line.strip()
+                if not cid and s.startswith("id:"):
+                    cid = s.split(":", 1)[1].strip()
+                elif not name and s.startswith("name:"):
+                    name = s.split(":", 1)[1].strip().strip('"')
+                elif not sev and s.startswith("severity:"):
+                    sev = s.split(":", 1)[1].strip()
+                if cid and name and sev:
+                    break
+    except Exception:
+        return None
+    m = _CVE_RE.search(path.name) or (_CVE_RE.search(cid) if cid else None)
+    if not m:
+        return None
+    return {
+        "cve": m.group(0).upper(),
+        "id": cid or path.stem,
+        "path": str(path),
+        "name": name,
+        "severity": sev or "unknown",
+    }
+
+
+def build_index(force: bool = False) -> dict:
+    root = templates_dir()
+    if root is None:
+        return {"_meta": {"templates_dir": None, "count": 0, "cves": 0}, "map": {}}
+
+    sig = _newest_mtime(root)
+    cache = _cache_file()
+    if not force and cache.exists():
+        try:
+            cached = json.loads(cache.read_text())
+            if cached.get("_meta", {}).get("sig") == sig and \
+               cached.get("_meta", {}).get("templates_dir") == str(root):
+                return cached
+        except Exception:
+            pass
+
+    mapping: dict[str, list] = {}
+    n = 0
+    for path in root.rglob("CVE-*.yaml"):
+        if ".git" in path.parts:
+            continue
+        rec = _parse_template(path)
+        if not rec:
+            continue
+        rec["path"] = str(Path(rec["path"]).relative_to(root))
+        mapping.setdefault(rec["cve"], []).append(rec)
+        n += 1
+
+    # Stable, useful ordering within a CVE: highest severity first.
+    for recs in mapping.values():
+        recs.sort(key=lambda r: _SEV_RANK.get(r["severity"].lower(), 0), reverse=True)
+
+    index = {
+        "_meta": {"templates_dir": str(root), "sig": sig, "count": n,
+                  "cves": len(mapping)},
+        "map": mapping,
+    }
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(index))
+    return index
+
+
+def templates_for_cve(cve: str) -> list[dict]:
+    cve = cve.strip().upper()
+    return build_index().get("map", {}).get(cve, [])
+
+
+def _cmd_for(rec: dict, host: str, rate: int, by_path: bool) -> str:
+    if by_path:
+        root = build_index().get("_meta", {}).get("templates_dir", "")
+        target = str(Path(root) / rec["path"]) if root else rec["path"]
+        return f"nuclei -t {target} -u {host} -rl {rate} -timeout 10"
+    # -id is stable across template relocation but scans the whole set to filter.
+    return f"nuclei -id {rec['id']} -u {host} -rl {rate} -timeout 10"
+
+
+def runnable_cmds(cve: str, host: str = "<host>", rate: int = 20,
+                  by_path: bool = False) -> list[str]:
+    """A rate-limited nuclei command for every template matching the CVE."""
+    return [_cmd_for(r, host, rate, by_path) for r in templates_for_cve(cve)]
+
+
+def runnable_cmd(cve: str, host: str = "<host>", rate: int = 20,
+                 by_path: bool = False) -> str | None:
+    """The single highest-severity nuclei command for a CVE, or None."""
+    recs = templates_for_cve(cve)
+    if not recs:
+        return None
+    return _cmd_for(recs[0], host, rate, by_path)  # recs sorted severity-desc
+
+
+def cli(argv: list[str] | None = None) -> None:
+    p = argparse.ArgumentParser(
+        prog="nuclei-index",
+        description="CVE -> local nuclei template index")
+    p.add_argument("--rebuild", action="store_true", help="force rebuild the index")
+    p.add_argument("--cve", help="look up templates for a CVE id")
+    p.add_argument("--host", default="<host>", help="host to embed in the command")
+    p.add_argument("--rate", type=int, default=20, help="nuclei rate-limit (default 20)")
+    p.add_argument("--by-path", action="store_true",
+                   help="emit `nuclei -t <path>` (faster) instead of `-id`")
+    p.add_argument("--stats", action="store_true", help="print index stats")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    args = p.parse_args(argv)
+
+    root = templates_dir()
+    if root is None:
+        msg = ("nuclei-templates dir not found. Set $NUCLEI_TEMPLATES or run "
+               "`nuclei -update-templates`.")
+        if args.json:
+            print(json.dumps({"error": msg}))
+        else:
+            print(f"[!] {msg}", file=sys.stderr)
+        sys.exit(1)
+
+    idx = build_index(force=args.rebuild)
+    meta = idx["_meta"]
+
+    if args.cve:
+        recs = templates_for_cve(args.cve)
+        cmds = runnable_cmds(args.cve, args.host, args.rate, args.by_path)
+        if args.json:
+            print(json.dumps({"cve": args.cve.strip().upper(),
+                              "templates": recs, "commands": cmds}))
+            return
+        if not recs:
+            print(f"\n[{args.cve.upper()}] no local nuclei template.")
+            print("  Try: nuclei -update-templates   (or check a newer CVE)")
+            return
+        print(f"\n[{args.cve.upper()}] {len(recs)} template(s):")
+        for r in recs:
+            print(f"  - {r['id']}  ({r['severity']})  {r['name']}")
+            print(f"    {meta['templates_dir']}/{r['path']}")
+        print("\n  Run (rate-limited, authorized hosts only):")
+        for c in cmds:
+            print(f"    {c}")
+        return
+
+    if args.json:
+        print(json.dumps(meta))
+    else:
+        print(f"templates_dir : {meta['templates_dir']}")
+        print(f"CVE templates : {meta['count']}")
+        print(f"unique CVEs   : {meta['cves']}")
+        print(f"cache         : {_cache_file()}")
+
+
+if __name__ == "__main__":
+    cli()

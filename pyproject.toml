@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nuclei-index"
+version = "0.1.0"
+description = "Map CVE IDs to your local nuclei-templates and emit runnable, rate-limited nuclei commands."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "towelful" }]
+keywords = ["nuclei", "cve", "security", "bug-bounty", "templates", "scanning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/towelful/nuclei-index"
+Issues = "https://github.com/towelful/nuclei-index/issues"
+
+[project.scripts]
+nuclei-index = "nuclei_index:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nuclei_index"]
