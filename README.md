@@ -55,7 +55,7 @@ $ nuclei-index --stats
 $ nuclei-index --rebuild
 ```
 
-The index is cached at `$XDG_CACHE_HOME/nuclei-index/` (default `~/.cache/nuclei-index/`) and rebuilt automatically when templates are added or removed. Hand-edited a template in place? Run `--rebuild`.
+The index is cached at `$XDG_CACHE_HOME/nuclei-index/` (default `~/.cache/nuclei-index/`) and refreshed automatically when CVE templates are added or removed under any `cves/` directory. The freshness check is a cheap signal over those directories — their modification times and year-subdir listings — so a clean run never has to re-scan every template to confirm the cache is current. It can't see two things on its own: an edit made *in place* to an existing template (filename and directory unchanged), or a CVE template dropped outside a `cves/` directory. Run `--rebuild` to force a full re-scan in those cases.
 
 ## As a library
 
