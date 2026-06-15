@@ -98,23 +98,31 @@ def _safe_rel(rel: str) -> bool:
     return not p.is_absolute() and ".." not in p.parts
 
 
-def _newest_mtime(root: Path) -> float:
-    """Cheap freshness signal: mtime of the cves/ subtree top dirs.
+def _freshness_sig(root: Path) -> list:
+    """Cheap freshness signal covering *every* cves/ subtree (http, network, dns,
+    code, ...), matching what build_index() actually rglob-indexes.
 
-    Catches templates added or removed (dir mtime changes); will not notice an
-    in-place edit to an existing file that leaves the directory listing intact.
-    That's fine for a git-pull-driven templates checkout — use --rebuild if you
-    hand-edit templates.
+    Only stats directories — never reads or rglob's template files — so the
+    cache-hit path stays cheap. Catches templates added or removed (a cves dir's
+    mtime and its year-subdir listing change) and brand-new year dirs (the year
+    count changes even when a coarse parent mtime doesn't). Will not notice an
+    in-place edit to an existing file — use --rebuild if you hand-edit templates.
+
+    Returned as a JSON-serializable list so it round-trips through the cache and
+    compares equal next run: a tuple would deserialize to a list and never match,
+    forcing a rebuild on every call.
     """
-    newest = root.stat().st_mtime
-    for sub in ("http/cves", "cves"):
-        d = root / sub
-        if d.is_dir():
-            newest = max(newest, d.stat().st_mtime)
-            for year in d.iterdir():
-                if year.is_dir():
-                    newest = max(newest, year.stat().st_mtime)
-    return newest
+    parts: list = [["", root.stat().st_mtime]]
+    for cves in root.rglob("cves"):
+        if not cves.is_dir() or ".git" in cves.parts:
+            continue
+        years = sorted(y for y in cves.iterdir() if y.is_dir())
+        entry: list = [str(cves.relative_to(root)), cves.stat().st_mtime, len(years)]
+        for y in years:
+            entry.append([y.name, y.stat().st_mtime])
+        parts.append(entry)
+    parts.sort()
+    return parts
 
 
 def _parse_template(path: Path) -> dict | None:
@@ -129,7 +137,7 @@ def _parse_template(path: Path) -> dict | None:
                 elif not name and s.startswith("name:"):
                     name = s.split(":", 1)[1].strip().strip('"')
                 elif not sev and s.startswith("severity:"):
-                    sev = s.split(":", 1)[1].strip()
+                    sev = s.split(":", 1)[1].split("#", 1)[0].strip()
                 if cid and name and sev:
                     break
     except Exception:
@@ -154,7 +162,7 @@ def build_index(force: bool = False) -> dict:
     if root is None:
         return {"_meta": {"templates_dir": None, "count": 0, "cves": 0}, "map": {}}
 
-    sig = _newest_mtime(root)
+    sig = _freshness_sig(root)
     cache = _cache_file()
     if not force and cache.exists():
         try:
