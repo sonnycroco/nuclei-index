@@ -11,10 +11,23 @@ becomes "run this".
 The index is cached under $XDG_CACHE_HOME/nuclei-index (or ~/.cache/nuclei-index)
 and rebuilt automatically when the templates directory changes (or on rebuild).
 
+SECURITY NOTE
+-------------
+nuclei-templates are thousands of third-party YAML files, and the on-disk cache
+may live in a shared cache dir. Every value pulled from a template or the cache
+is therefore treated as untrusted:
+  - emitted commands are assembled with shlex.join, so a poisoned `id:`/`path`
+    cannot inject shell metacharacters even if the output is piped to a shell;
+  - template ids are validated against a safe charset, and suspicious ones are
+    flagged in the output;
+  - fields printed to the terminal are stripped of control/escape characters
+    (no ANSI / title-bar injection);
+  - template paths that escape the templates root are rejected.
+
 Importable API:
     templates_dir() -> Path | None
     build_index(force=False) -> dict
-    templates_for_cve("CVE-2021-44228") -> list[dict]   # {cve,id,path,name,severity}
+    templates_for_cve("CVE-2021-44228") -> list[dict]
     runnable_cmd("CVE-2021-44228", host, rate=20, by_path=False) -> str | None
     runnable_cmds("CVE-2021-44228", host, rate=20, by_path=False) -> list[str]
 
@@ -29,12 +42,17 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
 __version__ = "0.1.0"
 
 _CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
+# A legitimate nuclei template id is lowercase-ish slug; anything else is suspect.
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+# C0 + DEL + C1 control characters — stripped before anything is printed.
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 # Severity rank for choosing a single "best" template when a CVE has several.
 _SEV_RANK = {
@@ -67,6 +85,17 @@ def templates_dir() -> Path | None:
         if c and Path(c).is_dir():
             return Path(c)
     return None
+
+
+def _clean(s: object) -> str:
+    """Strip control/escape chars — safe to print untrusted template fields."""
+    return _CTRL_RE.sub("", str(s))
+
+
+def _safe_rel(rel: str) -> bool:
+    """True if `rel` is a plain relative path that stays under the root."""
+    p = Path(rel)
+    return not p.is_absolute() and ".." not in p.parts
 
 
 def _newest_mtime(root: Path) -> float:
@@ -108,12 +137,15 @@ def _parse_template(path: Path) -> dict | None:
     m = _CVE_RE.search(path.name) or (_CVE_RE.search(cid) if cid else None)
     if not m:
         return None
+    rid = cid or path.stem
     return {
         "cve": m.group(0).upper(),
-        "id": cid or path.stem,
+        "id": rid,
         "path": str(path),
         "name": name,
         "severity": sev or "unknown",
+        # Flagged (not dropped) so a tampered template is visible, not silent.
+        "suspicious": not bool(_SAFE_ID_RE.match(rid)),
     }
 
 
@@ -141,7 +173,11 @@ def build_index(force: bool = False) -> dict:
         rec = _parse_template(path)
         if not rec:
             continue
-        rec["path"] = str(Path(rec["path"]).relative_to(root))
+        try:
+            rel = Path(rec["path"]).relative_to(root)
+        except ValueError:
+            continue  # symlink/path escaping the templates root — skip
+        rec["path"] = str(rel)
         mapping.setdefault(rec["cve"], []).append(rec)
         n += 1
 
@@ -154,8 +190,13 @@ def build_index(force: bool = False) -> dict:
                   "cves": len(mapping)},
         "map": mapping,
     }
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps(index))
+    # Atomic, owner-only write — avoids torn reads under concurrency and keeps
+    # the cache out of other local users' reach.
+    cache.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = cache.with_name(cache.name + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(index))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, cache)
     return index
 
 
@@ -165,12 +206,18 @@ def templates_for_cve(cve: str) -> list[dict]:
 
 
 def _cmd_for(rec: dict, host: str, rate: int, by_path: bool) -> str:
-    if by_path:
+    rate = max(1, int(rate))
+    parts = ["nuclei"]
+    if by_path and _safe_rel(rec.get("path", "")):
         root = build_index().get("_meta", {}).get("templates_dir", "")
         target = str(Path(root) / rec["path"]) if root else rec["path"]
-        return f"nuclei -t {target} -u {host} -rl {rate} -timeout 10"
-    # -id is stable across template relocation but scans the whole set to filter.
-    return f"nuclei -id {rec['id']} -u {host} -rl {rate} -timeout 10"
+        parts += ["-t", target]
+    else:
+        # -id is stable across template relocation but scans the whole set.
+        parts += ["-id", rec["id"]]
+    parts += ["-u", host, "-rl", str(rate), "-timeout", "10"]
+    # shlex.join quotes every field, so untrusted id/path/host can't inject.
+    return shlex.join(parts)
 
 
 def runnable_cmds(cve: str, host: str = "<host>", rate: int = 20,
@@ -188,6 +235,13 @@ def runnable_cmd(cve: str, host: str = "<host>", rate: int = 20,
     return _cmd_for(recs[0], host, rate, by_path)  # recs sorted severity-desc
 
 
+def _pos_int(v: str) -> int:
+    i = int(v)
+    if i <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return i
+
+
 def cli(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(
         prog="nuclei-index",
@@ -195,7 +249,8 @@ def cli(argv: list[str] | None = None) -> None:
     p.add_argument("--rebuild", action="store_true", help="force rebuild the index")
     p.add_argument("--cve", help="look up templates for a CVE id")
     p.add_argument("--host", default="<host>", help="host to embed in the command")
-    p.add_argument("--rate", type=int, default=20, help="nuclei rate-limit (default 20)")
+    p.add_argument("--rate", type=_pos_int, default=20,
+                   help="nuclei rate-limit (default 20)")
     p.add_argument("--by-path", action="store_true",
                    help="emit `nuclei -t <path>` (faster) instead of `-id`")
     p.add_argument("--stats", action="store_true", help="print index stats")
@@ -220,17 +275,19 @@ def cli(argv: list[str] | None = None) -> None:
         recs = templates_for_cve(args.cve)
         cmds = runnable_cmds(args.cve, args.host, args.rate, args.by_path)
         if args.json:
+            # json.dumps escapes control chars, so raw values are safe here.
             print(json.dumps({"cve": args.cve.strip().upper(),
                               "templates": recs, "commands": cmds}))
             return
         if not recs:
-            print(f"\n[{args.cve.upper()}] no local nuclei template.")
+            print(f"\n[{_clean(args.cve).upper()}] no local nuclei template.")
             print("  Try: nuclei -update-templates   (or check a newer CVE)")
             return
-        print(f"\n[{args.cve.upper()}] {len(recs)} template(s):")
+        print(f"\n[{_clean(args.cve).upper()}] {len(recs)} template(s):")
         for r in recs:
-            print(f"  - {r['id']}  ({r['severity']})  {r['name']}")
-            print(f"    {meta['templates_dir']}/{r['path']}")
+            flag = "  [!] SUSPICIOUS ID — verify before running" if r.get("suspicious") else ""
+            print(f"  - {_clean(r['id'])}  ({_clean(r['severity'])})  {_clean(r['name'])}{flag}")
+            print(f"    {_clean(meta['templates_dir'])}/{_clean(r['path'])}")
         print("\n  Run (rate-limited, authorized hosts only):")
         for c in cmds:
             print(f"    {c}")
@@ -239,7 +296,7 @@ def cli(argv: list[str] | None = None) -> None:
     if args.json:
         print(json.dumps(meta))
     else:
-        print(f"templates_dir : {meta['templates_dir']}")
+        print(f"templates_dir : {_clean(meta['templates_dir'])}")
         print(f"CVE templates : {meta['count']}")
         print(f"unique CVEs   : {meta['cves']}")
         print(f"cache         : {_cache_file()}")
