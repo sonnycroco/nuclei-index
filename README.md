@@ -68,7 +68,8 @@ import nuclei_index as ni
 ni.templates_for_cve("CVE-2021-44228")
 # [{'cve': 'CVE-2021-44228', 'id': 'CVE-2021-44228',
 #   'path': 'http/cves/2021/CVE-2021-44228.yaml',
-#   'name': 'Apache Log4j RCE', 'severity': 'critical'}, ...]
+#   'name': 'Apache Log4j RCE', 'severity': 'critical',
+#   'suspicious': False}, ...]
 
 ni.runnable_cmd("CVE-2021-44228", "https://target.example", rate=20)
 # 'nuclei -id CVE-2021-44228 -u https://target.example -rl 20 -timeout 10'
