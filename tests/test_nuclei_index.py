@@ -94,6 +94,82 @@ def test_cli_json(monkeypatch, tmp_path, capsys):
     assert len(out["commands"]) == 2
 
 
+def _poisoned_templates(tmp_path: Path) -> Path:
+    root = tmp_path / "evil-templates"
+    _make_template(root / "http" / "cves" / "2024" / "CVE-2024-00001.yaml",
+                   "CVE-2024-00001$(touch /tmp/ni_should_not_exist)",
+                   "ev\x1b[31mil\x1b]0;hijack\x07", "critical")
+    _make_template(root / "http" / "cves" / "2024" / "CVE-2024-00002.yaml",
+                   "x; rm -rf ~ #", "name; $(whoami)", "high")
+    return root
+
+
+def test_command_injection_is_neutralized(monkeypatch, tmp_path):
+    """F1/F3/F4: untrusted id/host must never break out of one shell argument."""
+    import shlex
+    _isolate(monkeypatch, tmp_path, _poisoned_templates(tmp_path))
+    ni.build_index(force=True)
+
+    cmd = ni.runnable_cmd("CVE-2024-00001",
+                          host="https://t$(touch /tmp/host_pwn)", rate=20)
+    # The whole command must tokenize to exactly the args we intended — the
+    # injection payload survives only as inert data inside single tokens.
+    toks = shlex.split(cmd)
+    assert toks[0] == "nuclei"
+    assert "-id" in toks and "-u" in toks
+    assert "CVE-2024-00001$(touch /tmp/ni_should_not_exist)" in toks  # one token
+    assert "https://t$(touch /tmp/host_pwn)" in toks                  # one token
+    # No metacharacter escaped quoting:
+    assert "$(touch /tmp/ni_should_not_exist)" not in shlex.split(cmd.replace("'", ""))[0:1]
+
+
+def test_suspicious_ids_flagged(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path, _poisoned_templates(tmp_path))
+    ni.build_index(force=True)
+    assert ni.templates_for_cve("CVE-2024-00001")[0]["suspicious"] is True
+    # A normal CVE template is not flagged.
+    _isolate(monkeypatch, tmp_path, _fake_templates(tmp_path))
+    ni.build_index(force=True)
+    assert ni.templates_for_cve("CVE-2021-44228")[0]["suspicious"] is False
+
+
+def test_terminal_escapes_stripped_from_output(monkeypatch, tmp_path, capsys):
+    """F2: no ESC/BEL/control bytes reach the terminal."""
+    _isolate(monkeypatch, tmp_path, _poisoned_templates(tmp_path))
+    ni.cli(["--cve", "CVE-2024-00001"])
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "\x07" not in out
+    assert "SUSPICIOUS" in out
+
+
+def test_negative_rate_rejected(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path, _fake_templates(tmp_path))
+    import pytest
+    with pytest.raises(SystemExit):
+        ni.cli(["--cve", "CVE-2021-44228", "--rate", "-5"])
+    # API clamps rather than emits a negative flag value.
+    ni.build_index(force=True)
+    assert "-rl -5" not in ni.runnable_cmd("CVE-2021-44228", "h", rate=-5)
+
+
+def test_path_traversal_in_by_path_blocked(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path, _fake_templates(tmp_path))
+    ni.build_index(force=True)
+    # Forge a rec whose path escapes root; _cmd_for must fall back to -id form.
+    bad = {"id": "CVE-2021-44228", "path": "../../../../etc/passwd"}
+    cmd = ni._cmd_for(bad, "h", 20, by_path=True)
+    assert "/etc/passwd" not in cmd
+    assert "-id" in cmd
+
+
+def test_cache_file_is_owner_only(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path, _fake_templates(tmp_path))
+    ni.build_index(force=True)
+    import stat
+    mode = stat.S_IMODE(ni._cache_file().stat().st_mode)
+    assert mode & 0o077 == 0  # no group/other access
+
+
 def test_module_entrypoint(monkeypatch, tmp_path):
     templates = _fake_templates(tmp_path)
     env = {"NUCLEI_TEMPLATES": str(templates),
